@@ -3,74 +3,75 @@ import pandas as pd
 import requests
 from thefuzz import fuzz
 
-st.set_page_config(page_title="CBB Arb Scanner", layout="wide")
+st.set_page_config(page_title="Top 5 CBB Arbs", layout="wide")
 
-# --- UI Sidebar Settings ---
-st.sidebar.header("⚙️ Strategy Settings")
-bankroll = st.sidebar.number_input("Total Bankroll ($)", value=1000, step=100)
-kelly_fraction = st.sidebar.slider("Kelly Fraction (0.5 = Half Kelly)", 0.1, 1.0, 0.5)
-match_threshold = st.sidebar.slider("Fuzzy Match Sensitivity", 50, 95, 70)
+st.title("🏀 Top 5 CBB Arbitrage Opportunities")
+st.sidebar.header("Filter Settings")
+match_sensitivity = st.sidebar.slider("Name Match Sensitivity", 50, 95, 75)
 
-st.title("🏀 No-Key CBB Arbitrage Scanner")
-st.caption("Using RapidFuzz for name matching & Public APIs for data")
-
-def get_data():
-    # 1. Get Polymarket CBB Data (Public Gamma API)
+def get_arb_data():
+    # Fetching Data (Same as before)
     poly_url = "https://gamma-api.polymarket.com/events?tag_id=100639&active=true"
-    poly_data = requests.get(poly_url).json()
-    
-    # 2. Get Kalshi CBB Data (Public V2 API)
     kalshi_url = "https://api.elections.kalshi.com/trade-api/v2/markets?limit=100&status=open"
-    kalshi_data = requests.get(kalshi_url).json().get('markets', [])
     
-    opportunities = []
+    try:
+        poly_events = requests.get(poly_url).json()
+        kalshi_markets = requests.get(kalshi_url).json().get('markets', [])
+    except:
+        return []
 
-    for p_event in poly_data:
-        p_title = p_event['title']
-        # Extract prices safely
+    found = []
+    for p_event in poly_events:
         try:
-            p_yes = float(p_event['markets'][0]['outcomePrices'][0])
-            p_no = float(p_event['markets'][0]['outcomePrices'][1])
-        except: continue
-        
-        for k_market in kalshi_data:
-            k_title = k_market['title']
+            p_title = p_event.get('title', "")
+            p_price = float(p_event['markets'][0]['outcomePrices'][0])
             
-            # --- FUZZY MATCHING LOGIC ---
-            # token_set_ratio ignores word order (Duke vs UNC == UNC @ Duke)
-            score = fuzz.token_set_ratio(p_title, k_title)
-            
-            if score >= match_threshold:
-                k_yes = k_market.get('yes_bid', 0) / 100
-                k_no = k_market.get('no_bid', 0) / 100
+            for k_market in kalshi_markets:
+                k_title = k_market.get('title', "")
+                score = fuzz.token_set_ratio(p_title, k_title)
                 
-                # Check Arb: Buy Poly YES ($p_yes) + Kalshi NO ($k_no)
-                cost = p_yes + k_no
-                if 0 < cost < 0.99:
-                    profit_pct = (1 - cost) * 100
+                if score >= match_sensitivity:
+                    k_no_price = k_market.get('no_ask', 0) / 100
+                    if k_no_price == 0: continue
                     
-                    # Kelly Criterion: f = (bp - q) / b
-                    b = (1 / cost) - 1  # Odds
-                    p = 0.5             # Conservative win prob
-                    f_star = ((p * b) - (1 - p)) / b
-                    bet_amount = max(0, f_star * bankroll * kelly_fraction)
-
-                    opportunities.append({
-                        "Match Score": score,
-                        "Game": f"{p_title} (Poly) vs {k_title} (Kalshi)",
-                        "Strategy": "Buy Poly YES / Kalshi NO",
-                        "Total Cost": f"${round(cost, 2)}",
-                        "Profit": f"{round(profit_pct, 1)}%",
-                        "Kelly Bet": f"${round(bet_amount, 2)}"
+                    total_cost = p_price + k_no_price
+                    # We calculate profit even if it's negative so we can show "Top 5"
+                    profit_raw = 1.00 - total_cost
+                    profit_pct = (profit_raw / total_cost) * 100
+                    
+                    found.append({
+                        "Game": p_title,
+                        "Poly Yes": p_price,
+                        "Kalshi No": k_no_price,
+                        "Total Cost": round(total_cost, 2),
+                        "Profit %": round(profit_pct, 2),
+                        "Is Arb": total_cost < 1.00
                     })
+        except: continue
+    return found
 
-    return opportunities
+# Styling function to turn the row green if it's a real Arb
+def highlight_arb(row):
+    if row['Is Arb']:
+        return ['background-color: #d4edda; color: #155724; font-weight: bold'] * len(row)
+    return [''] * len(row)
 
-if st.button('🚀 Scan for Arbitrage'):
-    results = get_data()
-    if results:
-        st.table(pd.DataFrame(results))
+if st.button('🔍 Scan Now'):
+    data = get_arb_data()
+    if data:
+        # 1. Convert to DataFrame
+        df = pd.DataFrame(data)
+        
+        # 2. Sort by Profit % and take only the top 5
+        top_5 = df.sort_values(by="Profit %", ascending=False).head(5)
+        
+        # 3. Apply the Green Highlight
+        styled_df = top_5.style.apply(highlight_arb, axis=1)
+        
+        st.write("### Top 5 Market Comparisons")
+        st.table(styled_df) # Use st.table for a clean look or st.dataframe for interactive
     else:
-        st.warning("No arbs found. High-frequency bots usually take these in seconds.")
+        st.info("No matching games found. Check back later!")
 
-st.info("Note: This uses public data. Execution requires a separate script with API Keys.")
+st.divider()
+st.caption("Green rows indicate a mathematical arbitrage (Profit % > 0).")
