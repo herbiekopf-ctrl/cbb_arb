@@ -1,69 +1,92 @@
 import streamlit as st
 import pandas as pd
 import requests
-from datetime import datetime
+from thefuzz import fuzz
+from thefuzz import process
 
-# --- CONFIGURATION ---
-# Polymarket Tag for NCAA Men's Basketball: 100148
+# --- CONFIG ---
 POLY_CBB_TAG = "100148"
-# Kalshi often uses series prefixes like 'KXMARMAD' (March Madness) or 'KXCBB'
-KALSHI_CBB_PREFIX = "KXCBB" 
+KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 
-def fetch_cbb_data():
-    # Targeted Polymarket CBB fetch
-    poly_url = f"https://gamma-api.polymarket.com/events?tag_id={POLY_CBB_TAG}&active=true&closed=false"
-    # Targeted Kalshi market fetch
-    kalshi_url = "https://api.elections.kalshi.com/trade-api/v2/markets?limit=200&status=open"
-    
+def get_poly_cbb():
+    url = f"https://gamma-api.polymarket.com/events?tag_id={POLY_CBB_TAG}&active=true&closed=false"
     try:
-        p_data = requests.get(poly_url).json()
-        k_data = requests.get(kalshi_url).json().get('markets', [])
-        
-        # Filter Kalshi specifically for College Basketball strings if no direct tag is available
-        k_cbb = [m for m in k_data if "College Basketball" in m.get('title', '') or KALSHI_CBB_PREFIX in m.get('ticker', '')]
-        return p_data, k_cbb
-    except Exception as e:
-        st.error(f"Fetch Error: {e}")
-        return [], []
-
-st.title("🏀 CBB Precision Scanner")
-tab1, tab2 = st.tabs(["🔍 Arb Scanner", "📊 Raw Data Audit"])
-
-p_raw, k_raw = fetch_cbb_data()
-
-with tab1:
-    st.subheader("Targeted NCAA Matches")
-    # (Existing matching logic goes here, now pre-filtered for CBB)
-    st.info(f"Scanning {len(p_raw)} Polymarket CBB events vs {len(k_raw)} Kalshi CBB markets.")
-
-with tab2:
-    st.subheader("Live Price Audit")
-    c1, c2 = st.columns(2)
-    
-    with c1:
-        st.markdown("### Polymarket (Yes Prices)")
-        if p_raw:
-            p_audit = []
-            for event in p_raw:
-                for m in event.get('markets', []):
-                    # outcomePrices[0] is typically the 'Yes' price
-                    price = m.get('outcomePrices', [0, 0])[0]
-                    p_audit.append({"Game": event['title'], "Yes Price": f"{float(price)*100:.1f}¢"})
-            st.dataframe(pd.DataFrame(p_audit), use_container_width=True)
-        else:
-            st.warning("No CBB data found on Polymarket.")
-
-    with c2:
-        st.markdown("### Kalshi (Order Book)")
-        if k_raw:
-            k_audit = []
-            for m in k_raw:
-                # Kalshi uses cents (0-100)
-                k_audit.append({
-                    "Market": m.get('title'),
-                    "Yes Bid": f"{m.get('yes_bid', 0)}¢",
-                    "No Ask": f"{m.get('no_ask', 0)}¢"
+        data = requests.get(url).json()
+        rows = []
+        for event in data:
+            for m in event.get('markets', []):
+                prices = m.get('outcomePrices', ["0", "0"])
+                rows.append({
+                    "Event": event.get('title'),
+                    "Poly_Yes": round(float(prices[0]) * 100, 1),
+                    "Poly_No": round(float(prices[1]) * 100, 1)
                 })
-            st.dataframe(pd.DataFrame(k_audit), use_container_width=True)
-        else:
-            st.warning("No CBB data found on Kalshi.")
+        return rows
+    except: return []
+
+def get_kalshi_cbb():
+    url = f"{KALSHI_BASE}/markets?limit=200&status=open"
+    try:
+        data = requests.get(url).json().get('markets', [])
+        rows = []
+        for m in data:
+            title = m.get('title', '')
+            if any(x in title for x in ["CBB", "NCAA", "College Basketball"]):
+                # Cleaning Kalshi titles which often look like "Will [Team] win..."
+                clean_title = title.replace("Will ", "").replace(" win?", "").strip()
+                rows.append({
+                    "Event": clean_title,
+                    "Kalshi_Yes": m.get('yes_bid', 0),
+                    "Kalshi_No": (100 - m.get('yes_ask', 100)) # Implied No price
+                })
+        return rows
+    except: return []
+
+# --- UI ---
+st.set_page_config(page_title="CBB Arb Hunter", layout="wide")
+st.title("🏀 CBB Cross-Exchange Arbitrage")
+
+p_raw = get_poly_cbb()
+k_raw = get_kalshi_cbb()
+
+if not p_raw or not k_raw:
+    st.warning("One or more APIs returned no data. Markets might be closed or keys/tags changed.")
+else:
+    # --- FUZZY MATCHING LOGIC ---
+    matches = []
+    poly_df = pd.DataFrame(p_raw)
+    kalshi_df = pd.DataFrame(k_raw)
+
+    for _, p_row in poly_df.iterrows():
+        # Find best name match in Kalshi list
+        match_result = process.extractOne(p_row['Event'], kalshi_df['Event'], scorer=fuzz.token_set_ratio)
+        
+        if match_result and match_result[1] > 70:  # 70% confidence threshold
+            k_row = kalshi_df[kalshi_df['Event'] == match_result[0]].iloc[0]
+            
+            # Arb Calculation: If (Poly Yes + Kalshi No) < 100
+            arb_opp = 100 - (p_row['Poly_Yes'] + k_row['Kalshi_No'])
+            
+            matches.append({
+                "Game": p_row['Event'],
+                "Polymarket Yes": f"{p_row['Poly_Yes']}¢",
+                "Kalshi No": f"{k_row['Kalshi_No']}¢",
+                "Total Cost": p_row['Poly_Yes'] + k_row['Kalshi_No'],
+                "Profit Margin": f"{arb_opp:.1f}%" if arb_opp > 0 else "None"
+            })
+
+    # --- DISPLAY ---
+    st.subheader("Detected Matches & Potential Arbitrage")
+    if matches:
+        res_df = pd.DataFrame(matches)
+        
+        # Highlight green if profit exists
+        def highlight_arb(s):
+            return ['background-color: #90ee90' if (isinstance(val, str) and "%" in val and float(val.replace('%','')) > 0) else '' for val in s]
+        
+        st.table(res_df.style.apply(highlight_arb, axis=1))
+    else:
+        st.info("No close naming matches found between the two exchanges.")
+
+st.divider()
+st.caption("Note: 'Total Cost' below 100 indicates a theoretical arbitrage opportunity.")
