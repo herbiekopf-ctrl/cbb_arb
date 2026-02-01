@@ -2,137 +2,111 @@ import streamlit as st
 import pandas as pd
 import requests
 from thefuzz import fuzz
-from datetime import datetime, timedelta
+from datetime import datetime
 
-st.set_page_config(page_title="Pro CBB Arb Scanner", layout="wide")
-st.title("🏀 Layered CBB Arb Scanner")
-st.caption("Matching by Name, Time, and Odds Fingerprints")
+st.set_page_config(page_title="Pro CBB Scanner", layout="wide")
 
 # --- UI Sidebar ---
 st.sidebar.header("Matching Sensitivity")
-time_buffer = st.sidebar.slider("Start Time Window (Hours)", 1, 48, 12) # Expanded default
+time_buffer = st.sidebar.slider("Start Time Window (Hours)", 1, 48, 12)
 odds_tolerance = st.sidebar.slider("Odds Similarity Tolerance (%)", 5, 40, 20)
-match_threshold = st.sidebar.slider("Name Sensitivity", 10, 95, 35) # Lowered default for acronyms
+match_threshold = st.sidebar.slider("Name Sensitivity", 10, 95, 35)
 
 def get_name_variants(name):
-    """
-    Condenses long names into acronyms and stretches short names into possibilities.
-    Returns a list of variations to check against.
-    """
     name = name.lower()
-    # Remove fluff
     noise = ["university of", "university", "state", "univ", "the ", "st.", "saint", "college", "mens", "basketball"]
     clean_base = name
     for word in noise:
         clean_base = clean_base.replace(word, "")
-    
     clean_base = clean_base.strip()
     words = clean_base.split()
-    
     variants = [clean_base]
-    
-    # 1. Create Acronym (e.g., 'north carolina' -> 'unc')
     if len(words) > 1:
-        acronym = "".join([w[0] for w in words])
-        variants.append(acronym)
-        # Special case: Many schools use 'u' prefix (UConn, UMich)
-        variants.append("u" + words[0])
-    
-    # 2. Add 'State' back to common acronyms
-    if "st" in clean_base:
-        variants.append(clean_base.replace("st", "state"))
-
+        variants.append("".join([w[0] for w in words])) # Acronym
     return list(set(variants))
 
-def get_data():
-    # Tag 100639 = CBB Game Winners
+# Helper to fetch data once per run
+def fetch_raw_data():
     poly_url = "https://gamma-api.polymarket.com/events?tag_id=100639&active=true"
     kalshi_url = "https://api.elections.kalshi.com/trade-api/v2/markets?limit=200&status=open"
-    
     try:
-        p_data = requests.get(poly_url).json()
-        k_data = requests.get(kalshi_url).json().get('markets', [])
-    except:
-        return []
+        p_raw = requests.get(poly_url).json()
+        k_raw = requests.get(kalshi_url).json().get('markets', [])
+        return p_raw, k_raw
+    except Exception as e:
+        st.error(f"API Error: {e}")
+        return [], []
 
-    found = []
-    for p in p_data:
-        try:
-            p_title = p['title']
-            # Better Odds Logic: Poly Yes vs Poly No
-            # Usually we compare Poly Yes to Kalshi No
-            p_yes = float(p['markets'][0]['outcomePrices'][0])
-            p_no = float(p['markets'][0]['outcomePrices'][1])
-            
-            p_time = datetime.fromisoformat(p['startDate'].replace('Z', '+00:00'))
-            
-            for k in k_data:
-                k_title = k['title']
-                
-                # Fetch Kalshi Yes/No
-                k_yes = (k.get('yes_bid', 0) / 100)
-                k_no = (k.get('no_ask', 0) / 100)
-                if k_no == 0: continue
-                
-                k_time = datetime.fromisoformat(k['close_time'].replace('Z', '+00:00'))
+# --- MAIN UI ---
+st.title("🏀 CBB Arbitrage Dashboard")
 
-                # --- LAYER 1: TIME CHECK ---
-                time_diff = abs((p_time - k_time).total_seconds() / 3600)
-                if time_diff > time_buffer:
-                    continue
+# Create Tabs
+tab1, tab2 = st.tabs(["🔍 Arb Scanner", "📊 Raw Odds Audit"])
 
-                # --- LAYER 2: BETTER ODDS SELECTION ---
-                # We want the cheapest way to buy 'Outcome A' and 'Not Outcome A'
-                # Poly_Yes + Kalshi_No is the standard Arb path.
-                total_cost = p_yes + k_no
-                
-                # --- LAYER 3: ADVANCED NAME MATCHING ---
-                p_variants = get_name_variants(p_title)
-                k_variants = get_name_variants(k_title)
-                
-                highest_match = 0
-                for pv in p_variants:
-                    for kv in k_variants:
-                        score = fuzz.token_set_ratio(pv, kv)
-                        if score > highest_match:
-                            highest_match = score
+p_raw, k_raw = fetch_raw_data()
 
-                if highest_match >= match_threshold:
-                    # Final Arb Calculation
-                    profit_pct = ((1.00 - total_cost) / total_cost) * 100
+with tab1:
+    st.subheader("Potential Arbitrage Opportunities")
+    if st.button('🔍 Run Scan'):
+        found = []
+        for p in p_raw:
+            try:
+                p_title = p['title']
+                p_yes = float(p['markets'][0]['outcomePrices'][0])
+                p_time = datetime.fromisoformat(p['startDate'].replace('Z', '+00:00'))
+                
+                for k in k_raw:
+                    k_title = k['title']
+                    k_yes = (k.get('yes_bid', 0) / 100)
+                    k_no = (k.get('no_ask', 0) / 100)
+                    if k_no == 0: continue
+                    k_time = datetime.fromisoformat(k['close_time'].replace('Z', '+00:00'))
+
+                    # Time & Odds Filtering
+                    time_diff = abs((p_time - k_time).total_seconds() / 3600)
+                    if time_diff > time_buffer: continue
                     
-                    # Only odds-gate it if it's NOT a potential Arb
-                    # If it IS an arb, we want to see it even if prices are weird
-                    if total_cost > 1.00 and abs(p_yes - k_yes) > (odds_tolerance / 100):
-                        continue
+                    # Name Matching
+                    p_variants = get_name_variants(p_title)
+                    k_variants = get_name_variants(k_title)
+                    highest_match = max([fuzz.token_set_ratio(pv, kv) for pv in p_variants for kv in k_variants])
 
-                    found.append({
-                        "Game": f"{p_title} / {k_title}",
-                        "Match Score": highest_match,
-                        "Poly Yes": round(p_yes, 2),
-                        "Kalshi No": round(k_no, 2),
-                        "Total Cost": round(total_cost, 2),
-                        "Profit %": round(profit_pct, 2),
-                        "Is Arb": total_cost < 1.00
-                    })
-        except: continue
-    return found
+                    if highest_match >= match_threshold:
+                        total_cost = p_yes + k_no
+                        profit_pct = ((1.00 - total_cost) / total_cost) * 100
+                        
+                        found.append({
+                            "Game": p_title,
+                            "Match": highest_match,
+                            "Poly Yes": p_yes,
+                            "Kalshi No": k_no,
+                            "Profit %": round(profit_pct, 2),
+                            "Is Arb": total_cost < 1.00
+                        })
+            except: continue
+        
+        if found:
+            df = pd.DataFrame(found).sort_values(by="Profit %", ascending=False).head(5)
+            st.table(df)
+        else:
+            st.warning("No matches found. Check the 'Raw Odds Audit' tab to see if data is loading.")
 
-def style_rows(row):
-    if row['Is Arb']:
-        return ['background-color: #d4edda; color: #155724; font-weight: bold'] * len(row)
-    return [''] * len(row)
+with tab2:
+    st.subheader("Raw Data Feed (Debug)")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.write("**Polymarket Raw (First 10)**")
+        if p_raw:
+            p_list = [{"Title": x.get('title'), "Price": x['markets'][0]['outcomePrices'][0]} for x in p_raw[:10]]
+            st.dataframe(pd.DataFrame(p_list))
+        else:
+            st.error("No data from Polymarket")
 
-if st.button('🔍 Scan with Layered Logic'):
-    results = get_data()
-    if results:
-        df = pd.DataFrame(results)
-        # Sort by Profitability
-        top_5 = df.sort_values(by="Profit %", ascending=False).head(5)
-        st.write("### Top 5 Market Comparisons")
-        st.table(top_5.style.apply(style_rows, axis=1))
-    else:
-        st.warning("No matches found. Try lowering 'Name Sensitivity' to 20 or widening 'Time Window'.")
-
-st.divider()
-st.caption("Note: This scanner uses fuzzy logic. Always verify the team names on the actual exchange before placing trades.")
+    with col2:
+        st.write("**Kalshi Raw (First 10)**")
+        if k_raw:
+            k_list = [{"Title": x.get('title'), "Yes Bid": x.get('yes_bid')} for x in k_raw[:10]]
+            st.dataframe(pd.DataFrame(k_list))
+        else:
+            st.error("No data from Kalshi")
